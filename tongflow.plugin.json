@@ -1,0 +1,30 @@
+{
+    "plugin": {
+        "name": "CometAPI",
+        "description": "CometAPI gateway — one key for 500+ models: text, vision, image gen/edit, video, TTS and transcription, with a live model picker.",
+        "icon": "/plugins/tongflow-router-cometapi.svg"
+    },
+    "env": [
+        {
+            "key": "COMETAPI_KEY",
+            "required": true,
+            "description": "CometAPI key",
+            "url": "https://api.cometapi.com/console/token"
+        },
+        {
+            "key": "COMETAPI_BASE_URL",
+            "default": "https://api.cometapi.com/v1",
+            "description": "Override the CometAPI endpoint"
+        },
+        {
+            "key": "COMETAPI_POLL_TIMEOUT_S",
+            "default": "900",
+            "description": "Max seconds to wait for an async video task"
+        },
+        {
+            "key": "COMETAPI_TTS_VOICE",
+            "default": "alloy",
+            "description": "Default TTS voice when the node sets no speaker"
+        }
+    ]
+}
