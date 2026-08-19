@@ -126,7 +126,6 @@ log = logging.getLogger("tongflow.plugins.cometapi")
 DEFAULT_BASE_URL = "https://api.cometapi.com/v1"
 DEFAULT_POLL_TIMEOUT_S = 900.0
 POLL_INTERVAL_S = 10.0
-DEFAULT_IMAGE_SIZE = "1024x1024"
 DEFAULT_VIDEO_SIZE = "1280x720"
 DEFAULT_VIDEO_SECONDS = 4
 DEFAULT_TTS_VOICE = "alloy"
@@ -304,6 +303,15 @@ def _multipart_json(url: str, fields: Dict[str, str], files: List[Tuple[str, str
     return obj
 
 
+def _raise_if_error(obj: Dict[str, Any]) -> None:
+    """Some upstreams answer 200 with an `error` object; surface its message."""
+    err = obj.get("error")
+    if not err:
+        return
+    msg = err.get("message") if isinstance(err, dict) else err
+    raise RuntimeError(f"CometAPI error: {str(msg)[:500]}")
+
+
 def _download(url: str) -> Tuple[bytes, str]:
     try:
         resp = urlopen(url, timeout=600)  # noqa: S310
@@ -327,10 +335,6 @@ def _asset_file(field: str, a: Asset, *, default_mime: str, default_ext: str) ->
 def _data_url(a: Asset, *, default_mime: str) -> str:
     mime = (a.mime or default_mime).strip() or default_mime
     return f"data:{mime};base64,{a.bytesBase64}"
-
-
-def _size(width: Optional[int], height: Optional[int], default: str) -> str:
-    return f"{width}x{height}" if width and height else default
 
 
 # ── Chat completions (text, vision, video, audio understanding) ───────────
@@ -383,6 +387,83 @@ def _text_and_audio_parts(text: str, audio: Asset) -> List[Dict[str, Any]]:
         {"type": "text", "text": text},
         {"type": "input_audio", "input_audio": {"data": audio.bytesBase64, "format": fmt}},
     ]
+
+
+def _gemini_root() -> str:
+    """Gateway root (no /v1) — the native Gemini route lives at /v1beta."""
+    base = _base_url()
+    return base[: -len("/v1")] if base.endswith("/v1") else base
+
+
+def _gemini_generate(model: str, system: Optional[str], text: str, media: Asset, *, default_mime: str, **params: Any) -> str:
+    """Native `generateContent` with inline media. Gemini through the
+    OpenAI-compatible chat route silently drops `video_url` parts on CometAPI,
+    so video/audio understanding goes native whenever the model is a Gemini."""
+    mime = (media.mime or default_mime).strip() or default_mime
+    body: Dict[str, Any] = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": text},
+                    {"inline_data": {"mime_type": mime, "data": media.bytesBase64}},
+                ],
+            }
+        ]
+    }
+    if system and system.strip():
+        body["systemInstruction"] = {"parts": [{"text": system.strip()}]}
+    gen: Dict[str, Any] = {}
+    if params.get("temperature") is not None:
+        gen["temperature"] = params["temperature"]
+    if params.get("top_p") is not None:
+        gen["topP"] = params["top_p"]
+    if params.get("max_tokens") is not None:
+        gen["maxOutputTokens"] = params["max_tokens"]
+    if gen:
+        body["generationConfig"] = gen
+    url = f"{_gemini_root()}/v1beta/models/{model}:generateContent"
+    log.info("POST %s", url)
+    req = Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"x-goog-api-key": _require_api_key(), "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        resp = urlopen(req, timeout=600)  # noqa: S310
+    except HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError(f"HTTP {e.code} from CometAPI (gemini): {err_body[:500] or e.reason}") from e
+    except URLError as e:
+        raise RuntimeError(f"Network error contacting CometAPI: {e.reason}") from e
+    obj = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+    _raise_if_error(obj)
+    cands = obj.get("candidates") or []
+    parts = ((cands[0].get("content") or {}).get("parts") or []) if cands and isinstance(cands[0], dict) else []
+    answer = "".join(str(p.get("text") or "") for p in parts if isinstance(p, dict) and not p.get("thought"))
+    if not answer.strip():
+        raise RuntimeError(f"Empty Gemini answer from CometAPI: {str(obj)[:300]}")
+    return answer
+
+
+def _is_gemini(model: str) -> bool:
+    return model.lower().startswith("gemini")
+
+
+def _understand_media(slot: str, system: Optional[str], text: str, media: Asset, *, kind: str, **params: Any) -> str:
+    """Video/audio → text. Gemini models go native; others get OpenAI-style
+    `video_url` / `input_audio` chat parts."""
+    model = _active_model(slot)
+    if _is_gemini(model):
+        default_mime = "video/mp4" if kind == "video" else "audio/wav"
+        return _gemini_generate(model, system, text, media, default_mime=default_mime, **params)
+    content = _text_and_video_parts(text, media) if kind == "video" else _text_and_audio_parts(text, media)
+    return _chat(slot, _messages(system, content), **params)
 
 
 def _messages(system: Optional[str], user_content: Any) -> List[Dict[str, Any]]:
@@ -493,8 +574,8 @@ def video_describe(input: VideoDescribeInput) -> VideoDescribeOutput:
         or (input.text or "").strip()
         or "Describe this video in detail: scenes, subjects, actions, camera, mood."
     )
-    content = _text_and_video_parts(instruction, input.video)
-    return VideoDescribeOutput(success=True, text=_chat("video-describe", _messages(None, content)))
+    answer = _understand_media("video-describe", None, instruction, input.video, kind="video")
+    return VideoDescribeOutput(success=True, text=answer)
 
 
 @node_slot(NodeSlots.VIDEO_GEN_TEXT)
@@ -502,9 +583,12 @@ def video_gen_text(input: VideoGenTextInput) -> VideoGenTextOutput:
     text = (input.text or "").strip()
     if not text:
         return VideoGenTextOutput(success=False, error="Missing input text")
-    answer = _chat(
+    answer = _understand_media(
         "video-gen-text",
-        _messages(input.system, _text_and_video_parts(text, input.video)),
+        input.system,
+        text,
+        input.video,
+        kind="video",
         temperature=input.temperature,
         top_p=input.top_p,
         max_tokens=input.max_new_tokens,
@@ -519,14 +603,15 @@ def audio_describe(input: AudioDescribeInput) -> AudioDescribeOutput:
         or (input.text or "").strip()
         or "Describe this audio in detail (speech content, speakers, music, mood, notable events)."
     )
-    content = _text_and_audio_parts(instruction, input.audio)
-    return AudioDescribeOutput(success=True, text=_chat("audio-describe", _messages(None, content)))
+    answer = _understand_media("audio-describe", None, instruction, input.audio, kind="audio")
+    return AudioDescribeOutput(success=True, text=answer)
 
 
 # ── Images ─────────────────────────────────────────────────────────────────
 
 
 def _extract_image(obj: Dict[str, Any]) -> Asset:
+    _raise_if_error(obj)
     # Sync responses put the list at `data`; async-task lookups nest it one
     # level deeper (`data.data`) — accept both.
     data = obj.get("data")
@@ -548,12 +633,12 @@ def image_gen(input: ImageGenInput) -> ImageGenOutput:
     text = (input.text or "").strip()
     if not text:
         return ImageGenOutput(success=False, error="Missing text prompt")
-    body: Dict[str, Any] = {
-        "model": _active_model("image-gen"),
-        "prompt": text,
-        "n": 1,
-        "size": _size(input.width, input.height, DEFAULT_IMAGE_SIZE),
-    }
+    body: Dict[str, Any] = {"model": _active_model("image-gen"), "prompt": text, "n": 1}
+    # Only pin `size` when the node asks for one — minimum/allowed sizes differ
+    # per model (Seedream 5 wants >= 1920x1920, GPT Image 1024-ish), so the
+    # model's own default is the safe choice otherwise.
+    if input.width and input.height:
+        body["size"] = f"{input.width}x{input.height}"
     obj = _json_request("POST", _base_url() + "/images/generations", body, timeout=600)
     return ImageGenOutput(success=True, image=_extract_image(obj))
 
@@ -616,6 +701,7 @@ def _video_poll(task_id: str) -> Asset:
     deadline = time.monotonic() + _poll_timeout()
     while True:
         obj = _json_request("GET", f"{_base_url()}/videos/{task_id}", timeout=60)
+        _raise_if_error(obj)
         status = str(obj.get("status") or "").lower()
         if status == "completed":
             url = obj.get("video_url") or obj.get("url")
@@ -641,6 +727,40 @@ def _video_poll(task_id: str) -> Asset:
         time.sleep(POLL_INTERVAL_S)
 
 
+def _image_dims(data: bytes) -> Optional[Tuple[int, int]]:
+    try:
+        from io import BytesIO
+
+        from PIL import Image  # type: ignore[import-not-found]
+
+        with Image.open(BytesIO(data)) as im:
+            return int(im.width), int(im.height)
+    except Exception:  # noqa: BLE001 — Pillow missing or undecodable input
+        return None
+
+
+def _fit_reference(data: bytes, size: str) -> Tuple[bytes, str]:
+    """Scale-and-center-crop a reference image to exactly `size` (WxH) as PNG.
+    Sora rejects references whose pixels differ from the requested size; other
+    routes tolerate it, and a frame that already matches is passed through."""
+    try:
+        from io import BytesIO
+
+        from PIL import Image, ImageOps  # type: ignore[import-not-found]
+
+        w, h = (int(x) for x in size.lower().split("x"))
+        with Image.open(BytesIO(data)) as im:
+            if (im.width, im.height) == (w, h):
+                return data, "image/png" if im.format == "PNG" else f"image/{(im.format or 'png').lower()}"
+            fitted = ImageOps.fit(im.convert("RGB"), (w, h), method=Image.Resampling.LANCZOS)
+            buf = BytesIO()
+            fitted.save(buf, format="PNG")
+            return buf.getvalue(), "image/png"
+    except Exception as e:  # noqa: BLE001 — fall back to the original bytes
+        log.warning("could not fit reference image to %s: %s", size, e)
+        return data, "image/png"
+
+
 def _generate_video(
     slot: str,
     prompt: str,
@@ -649,16 +769,23 @@ def _generate_video(
     height: Optional[int],
     images: List[Asset],
 ) -> Asset:
+    raw_images = [_asset_bytes(img) for img in images]
+    if width and height:
+        size = f"{width}x{height}"
+    else:
+        # No explicit size: follow the first reference's orientation.
+        dims = _image_dims(raw_images[0]) if raw_images else None
+        size = "720x1280" if dims and dims[1] > dims[0] else DEFAULT_VIDEO_SIZE
     fields = {
         "model": _active_model(slot),
         "prompt": prompt,
         "seconds": _seconds(duration),
-        "size": _size(width, height, DEFAULT_VIDEO_SIZE),
+        "size": size,
     }
-    files = [
-        _asset_file("input_reference", img, default_mime="image/png", default_ext="png")
-        for img in images
-    ]
+    files: List[Tuple[str, str, str, bytes]] = []
+    for i, data in enumerate(raw_images):
+        fitted, mime = _fit_reference(data, size)
+        files.append(("input_reference", f"reference_{i}.png", mime, fitted))
     return _video_poll(_video_submit_multipart(fields, files))
 
 
