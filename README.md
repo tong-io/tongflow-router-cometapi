@@ -48,3 +48,9 @@ echo '{"nodeSlot":"gen-text","model":"gemini-3.5-flash","prompt":{"text":"Say hi
 ```
 
 Plugin logs go to stderr; stdout is the single ABI JSON response.
+
+## Getting help with CometAPI
+
+Questions about CometAPI itself — pricing, model coverage, quota — go to CometAPI, not this repo: [emery@askcometapi.com](mailto:emery@askcometapi.com). Mention you came from TongFlow and they can set you up with starter credits.
+
+Bugs in this plugin (a slot failing, a wrong request shape) belong in [issues](https://github.com/tong-io/tongflow-router-cometapi/issues).
